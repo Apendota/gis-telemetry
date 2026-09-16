@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Bridge Telemetry Map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body { height: 100%; margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #map { height: 100%; width: 100%; }
+
+  .panel {
+    background: rgba(255, 255, 255, 0.95);
+    border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    padding: 10px 12px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .panel h1 {
+    font-size: 14px;
+    margin: 0 0 6px;
+  }
+  .panel label { display: block; margin-top: 6px; }
+  .panel select, .panel button {
+    font-size: 13px;
+    padding: 3px 6px;
+    margin-top: 2px;
+  }
+  .panel button {
+    margin-top: 8px;
+    cursor: pointer;
+  }
+  .stat { color: #444; }
+  .legend-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const API_BASE = "";
+
+const map = L.map("map");
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  attribution: "&copy; OpenStreetMap contributors",
+  maxZoom: 19,
+}).addTo(map);
+map.setView([37.825, -122.4785], 14);
+
+const readingsLayer = L.layerGroup().addTo(map);
+const sensorsLayer = L.layerGroup().addTo(map);
+
+const controlDiv = L.control({ position: "topright" });
+controlDiv.onAdd = function () {
+  const div = L.DomUtil.create("div", "panel");
+  div.innerHTML = `
+    <h1>Bridge Strain Telemetry</h1>
+    <label>Sensor
+      <select id="sensorFilter">
+        <option value="">All sensors</option>
+      </select>
+    </label>
+    <label>
+      <input type="checkbox" id="anomaliesOnly" /> Anomalies only
+    </label>
+    <button id="refreshBtn">Refresh</button>
+    <div class="stat" id="statLine" style="margin-top:8px;"></div>
+  `;
+  L.DomEvent.disableClickPropagation(div);
+  return div;
+};
+controlDiv.addTo(map);
+
+const legend = L.control({ position: "bottomright" });
+legend.onAdd = function () {
+  const div = L.DomUtil.create("div", "panel");
+  div.innerHTML = `
+    <span class="legend-swatch" style="background:#2b7de9;"></span>Normal reading<br/>
+    <span class="legend-swatch" style="background:#e74c3c;"></span>Anomaly<br/>
+    <span class="legend-swatch" style="background:#555;"></span>Sensor mount
+  `;
+  return div;
+};
+legend.addTo(map);
+
+function pointToLayer(feature, latlng) {
+  const isAnomaly = feature.properties.is_anomaly;
+  return L.circleMarker(latlng, {
+    radius: isAnomaly ? 7 : 5,
+    color: isAnomaly ? "#c0392b" : "#1f5fa8",
+    fillColor: isAnomaly ? "#e74c3c" : "#2b7de9",
+    fillOpacity: 0.85,
+    weight: 1,
+  });
+}
+
+function bindPopup(feature, layer) {
+  const p = feature.properties;
+  const recordedAt = new Date(p.recorded_at).toLocaleString();
+  layer.bindPopup(`
+    <strong>${p.sensor_id}</strong><br/>
+    Strain: ${p.strain_value.toFixed(2)} µε<br/>
+    Recorded: ${recordedAt}<br/>
+    ${p.is_anomaly ? '<span style="color:#c0392b;">⚠ Anomaly</span>' : "Normal"}
+  `);
+}
+
+async function loadSensors() {
+  const res = await fetch(`${API_BASE}/sensors`);
+  const sensors = await res.json();
+
+  const select = document.getElementById("sensorFilter");
+  sensors
+    .slice()
+    .sort((a, b) => a.sensor_id.localeCompare(b.sensor_id))
+    .forEach((s) => {
+      const opt = document.createElement("option");
+      opt.value = s.sensor_id;
+      opt.textContent = `${s.sensor_id} (${s.bridge_name})`;
+      select.appendChild(opt);
+    });
+
+  sensorsLayer.clearLayers();
+  const sorted = sensors.slice().sort((a, b) => a.sensor_id.localeCompare(b.sensor_id));
+
+  if (sorted.length > 1) {
+    L.polyline(
+      sorted.map((s) => [s.latitude, s.longitude]),
+      { color: "#555", weight: 2, dashArray: "4 4", opacity: 0.6 }
+    ).addTo(sensorsLayer);
+  }
+
+  sorted.forEach((s) => {
+    L.circleMarker([s.latitude, s.longitude], {
+      radius: 4,
+      color: "#555",
+      fillColor: "#555",
+      fillOpacity: 1,
+    })
+      .bindPopup(`<strong>${s.sensor_id}</strong><br/>${s.bridge_name}<br/>Installed: ${s.installed_at}`)
+      .addTo(sensorsLayer);
+  });
+
+  return sorted;
+}
+
+let firstLoad = true;
+
+async function loadReadings() {
+  const sensorId = document.getElementById("sensorFilter").value;
+  const anomaliesOnly = document.getElementById("anomaliesOnly").checked;
+
+  const params = new URLSearchParams({ limit: "1000" });
+  if (sensorId) params.set("sensor_id", sensorId);
+  if (anomaliesOnly) params.set("anomalies_only", "true");
+
+  const res = await fetch(`${API_BASE}/readings/geojson?${params.toString()}`);
+  const geojson = await res.json();
+
+  readingsLayer.clearLayers();
+  const layer = L.geoJSON(geojson, { pointToLayer, onEachFeature: bindPopup });
+  layer.addTo(readingsLayer);
+
+  const anomalyCount = geojson.features.filter((f) => f.properties.is_anomaly).length;
+  document.getElementById("statLine").textContent =
+    `${geojson.features.length} readings loaded (${anomalyCount} anomalies)`;
+
+  if (firstLoad && geojson.features.length > 0) {
+    map.fitBounds(layer.getBounds(), { padding: [30, 30] });
+    firstLoad = false;
+  }
+}
+
+(async function init() {
+  await loadSensors();
+  await loadReadings();
+
+  document.getElementById("sensorFilter").addEventListener("change", loadReadings);
+  document.getElementById("anomaliesOnly").addEventListener("change", loadReadings);
+  document.getElementById("refreshBtn").addEventListener("click", loadReadings);
+})();
+</script>
+</body>
+</html>
